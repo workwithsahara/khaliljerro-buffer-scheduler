@@ -59,6 +59,59 @@ const DRY_RUN = process.env.DRY_RUN === "true";
 
 const BUFFER_GRAPHQL_URL = "https://api.buffer.com/graphql";
 
+// ---------------------------------------------------------------------------
+// STORY track: one "LAYA 365 story" post per day at 11:00 PM Manila, read from
+// story-365-part1..4.json (365 posts written with the booking link, repeating
+// every 365 days; the workflow downloads the files before the script runs).
+// Stateless like the other tracks: the post is picked from a fixed daily grid,
+// nothing is stored. Text only on LinkedIn, with the booking link.
+// ---------------------------------------------------------------------------
+const fs = require("fs");
+const path = require("path");
+const STORY_LINK_LINE = "Pick a time at laya365.com/contact";
+const STORY_DM_LINE = "Send us a DM and we'll find a time.";
+const STORY_WITH_IMAGE = false;
+const STORY_IMAGE_URL = "https://raw.githubusercontent.com/workwithsahara/laya-meta-buffer-scheduler/main/laya-story-image.jpg";
+const STORY_HOOKS = [
+  "Did I get your attention?",
+  "Okay, now that I have you.",
+  "Scary, right? Not as scary as a page that went quiet.",
+];
+let STORY_POSTS = [];
+for (let i = 1; i <= 4; i++) {
+  try {
+    STORY_POSTS = STORY_POSTS.concat(JSON.parse(fs.readFileSync(path.join(__dirname, `story-365-part${i}.json`), "utf8")));
+  } catch (err) {
+    console.warn(`STORY: could not load story-365-part${i}.json (${err.message}). Track disabled.`);
+    STORY_POSTS = [];
+    break;
+  }
+}
+const STORY_SET = new Set();
+STORY_POSTS.forEach((t) => {
+  STORY_SET.add(t.trim());
+  STORY_SET.add(t.split(STORY_LINK_LINE).join(STORY_DM_LINE).trim());
+});
+const STORY_EPOCH_START = new Date("2026-10-10T15:00:00Z"); // 11:00 PM Manila. Never change once live.
+const STORY_START_INDEX = 0; // index of the story posted in slot 0
+const STORY_INTERVAL_MS = 24 * 60 * 60 * 1000;
+function isStory(text) {
+  let t = (text || "").trim();
+  for (const h of STORY_HOOKS) {
+    if (t.startsWith(h + "\n\n")) { t = t.slice(h.length).trim(); break; }
+  }
+  return STORY_SET.has(t);
+}
+function storyTimeForSlot(slot) { return new Date(STORY_EPOCH_START.getTime() + slot * STORY_INTERVAL_MS); }
+function storySlotForTime(date) { return Math.round((date.getTime() - STORY_EPOCH_START.getTime()) / STORY_INTERVAL_MS); }
+function storyIndexForSlot(slot) { return (((STORY_START_INDEX + slot) % STORY_POSTS.length) + STORY_POSTS.length) % STORY_POSTS.length; }
+function storyText(slot) {
+  const idx = storyIndexForSlot(slot);
+  const t = STORY_POSTS[idx];
+  if (!STORY_WITH_IMAGE) return t;
+  return STORY_HOOKS[idx % STORY_HOOKS.length] + "\n\n" + t.split(STORY_LINK_LINE).join(STORY_DM_LINE);
+}
+
 function requireEnv(name) {
   const v = process.env[name];
   if (!v) {
@@ -208,6 +261,18 @@ async function getScheduledDates(channelId) {
   return new Set(data.posts.edges.map((e) => e.node.dueAt.slice(0, 10)));
 }
 
+async function getScheduledPosts(channelId) {
+  const query = `
+    query Posts($organizationId: OrganizationId!, $channelIds: [ChannelId!]) {
+      posts(input: { organizationId: $organizationId, filter: { channelIds: $channelIds, status: [scheduled] } }, first: 100) {
+        edges { node { dueAt text } }
+      }
+    }
+  `;
+  const data = await bufferRequest(query, { organizationId: ORG_ID, channelIds: [channelId] });
+  return data.posts.edges.map((e) => ({ dueAt: new Date(e.node.dueAt), text: e.node.text || "" }));
+}
+
 async function createPost({ channelId, fileId, title, dueAtIso }) {
   const mutation = `
     mutation CreatePost($input: CreatePostInput!) {
@@ -236,6 +301,9 @@ async function createPost({ channelId, fileId, title, dueAtIso }) {
     // LinkedIn Profile posts don't require an explicit "type" the way
     // Facebook/Instagram do — no extra metadata needed here.
   };
+  // Text-only posts (STORY track) have no image.
+  if (!fileId) delete input.assets;
+  else if (/^https?:/.test(fileId)) input.assets[0].image.url = fileId;
   if (DRY_RUN) {
     console.log(`[DRY RUN] Would create post: channel=${channelId} dueAt=${dueAtIso} title="${title}"`);
     return;
@@ -266,30 +334,68 @@ async function main() {
 
   const today = new Date().toISOString().slice(0, 10);
 
-  const scheduledDates = await getScheduledDates(CHANNEL_ID);
-  let scheduledCount = scheduledDates.size;
-  console.log(`Channel ${CHANNEL_ID}: ${scheduledCount}/${limit} slots currently used.`);
+  const scheduled = await getScheduledPosts(CHANNEL_ID);
+  const storyScheduled = scheduled.filter((p) => isStory(p.text));
+  // Story posts must not count as a day's dated post, or they would block it.
+  const scheduledDates = new Set(
+    scheduled.filter((p) => !isStory(p.text)).map((p) => p.dueAt.toISOString().slice(0, 10))
+  );
+  let scheduledCount = scheduled.length;
+  console.log(`Channel ${CHANNEL_ID}: ${scheduledCount}/${limit} slots currently used (STORY: ${storyScheduled.length}).`);
+
+  const LEAD_BUFFER_MS = 5 * 60 * 1000; // dueAt must always be in the future
+  const nowStorySlot = Math.max(0, Math.ceil((Date.now() + LEAD_BUFFER_MS - STORY_EPOCH_START.getTime()) / STORY_INTERVAL_MS));
+  const latestStorySlot = storyScheduled.length
+    ? Math.max(...storyScheduled.map((p) => storySlotForTime(p.dueAt)))
+    : -1;
+  let nextStorySlot = Math.max(nowStorySlot, latestStorySlot + 1);
+  let storyFailed = false;
+
+  const pendingDates = sortedDates.filter((d) => {
+    if (d < today) return false;
+    if (MIN_DATE && d < MIN_DATE) return false;
+    if (scheduledDates.has(d)) return false;
+    return new Date(`${d}T${POST_TIME_LOCAL}${POST_UTC_OFFSET}`).getTime() > Date.now() + LEAD_BUFFER_MS;
+  });
+  let di = 0;
 
   let consecutiveFailures = 0;
   const MAX_CONSECUTIVE_FAILURES = 3;
 
-  for (const dateKey of sortedDates) {
-    if (scheduledCount >= limit) break;
-    if (dateKey < today) continue;
-    if (MIN_DATE && dateKey < MIN_DATE) continue;
-    if (scheduledDates.has(dateKey)) continue;
-
-    const { fileId, title } = calendar[dateKey];
-    const dueAtIso = `${dateKey}T${POST_TIME_LOCAL}${POST_UTC_OFFSET}`;
+  // Dated posts and story posts share the channel's queue, earliest first.
+  while (scheduledCount < limit) {
+    const dateKey = pendingDates[di];
+    const datedTime = dateKey ? new Date(`${dateKey}T${POST_TIME_LOCAL}${POST_UTC_OFFSET}`) : null;
+    const storyTime = STORY_POSTS.length > 0 && !storyFailed ? storyTimeForSlot(nextStorySlot) : null;
+    if (!datedTime && !storyTime) break;
+    const useStory = storyTime && (!datedTime || storyTime.getTime() < datedTime.getTime());
 
     try {
-      await createPost({ channelId: CHANNEL_ID, fileId, title, dueAtIso });
+      if (useStory) {
+        await createPost({
+          channelId: CHANNEL_ID,
+          fileId: STORY_WITH_IMAGE ? STORY_IMAGE_URL : null,
+          title: storyText(nextStorySlot),
+          dueAtIso: storyTime.toISOString(),
+        });
+        nextStorySlot++;
+      } else {
+        const { fileId, title } = calendar[dateKey];
+        await createPost({ channelId: CHANNEL_ID, fileId, title, dueAtIso: `${dateKey}T${POST_TIME_LOCAL}${POST_UTC_OFFSET}` });
+        di++;
+      }
       scheduledCount++;
       consecutiveFailures = 0;
     } catch (err) {
-      console.error(`Failed to schedule ${dateKey}: ${err.message}`);
-      consecutiveFailures++;
+      console.error(`Failed to schedule ${useStory ? `STORY slot ${nextStorySlot}` : dateKey}: ${err.message}`);
       if (/limit/i.test(err.message)) break;
+      if (useStory) {
+        storyFailed = true;
+        console.error("  STORY track paused for the rest of this run.");
+        continue;
+      }
+      di++;
+      consecutiveFailures++;
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
         console.error(`Stopping after ${consecutiveFailures} consecutive failures.`);
         break;
