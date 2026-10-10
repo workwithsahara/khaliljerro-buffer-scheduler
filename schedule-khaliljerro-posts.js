@@ -304,6 +304,7 @@ async function createPost({ channelId, fileId, title, dueAtIso }) {
   // Text-only posts (STORY track) have no image.
   if (!fileId) delete input.assets;
   else if (/^https?:/.test(fileId)) input.assets[0].image.url = fileId;
+  if (process.env.POST_NOW_STORY) { input.mode = "shareNow"; delete input.dueAt; }
   if (DRY_RUN) {
     console.log(`[DRY RUN] Would create post: channel=${channelId} dueAt=${dueAtIso} title="${title}"`);
     return;
@@ -319,8 +320,16 @@ async function createPost({ channelId, fileId, title, dueAtIso }) {
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
+async function postStoryNow() {
+  const slot = parseInt(process.env.POST_NOW_STORY, 10);
+  const title = storyText(slot);
+  await createPost({ channelId: CHANNEL_ID, fileId: STORY_WITH_IMAGE ? STORY_IMAGE_URL : null, title, dueAtIso: new Date().toISOString() });
+  console.log("POSTED NOW to Khalil LinkedIn");
+}
+
 async function main() {
   console.log(`Run started ${new Date().toISOString()}${DRY_RUN ? " [DRY RUN]" : ""}`);
+  if (process.env.POST_NOW_STORY) { await postStoryNow(); return; }
 
   const calendar = await buildCalendar();
   const sortedDates = Object.keys(calendar).sort();
